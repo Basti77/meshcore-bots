@@ -1,0 +1,16 @@
+[Unit]
+Description=meshbot-wetter — Windy 6h forecast ticker for MeshCore
+After=network-online.target meshcore-matrix-bridge.service
+Wants=network-online.target
+PartOf=default.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.meshcore-bot-secrets/wetter.env
+ExecStart=%h/.local/venvs/meshcore-bots/bin/python -m bots.wetter.main
+WorkingDirectory=%h/meshcore-bots
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target

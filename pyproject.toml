@@ -1,0 +1,23 @@
+[project]
+name = "meshcore-bots"
+version = "0.1.0"
+description = "Matrix bots for the MeshCore↔Matrix bridge (weather, mentions, ...)."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+  "matrix-nio>=0.25.0",
+  "requests>=2.31",
+  "apscheduler>=3.10",
+]
+
+[project.scripts]
+meshbot-wetter = "bots.wetter.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["bots*", "shared*"]
