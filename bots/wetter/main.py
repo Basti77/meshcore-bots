@@ -33,7 +33,7 @@ def _env(key: str, default: str | None = None, required: bool = False) -> str:
 
 async def _post_forecast(sender: SimpleMatrixSender, room_id: str, cfg: dict) -> None:
     try:
-        hours = fetch_forecast(cfg["windy_key"], cfg["lat"], cfg["lon"], cfg["model"])
+        hours = fetch_forecast(cfg["lat"], cfg["lon"], cfg["model"])
     except Exception as e:
         log.exception("windy fetch failed: %s", e)
         return
@@ -68,8 +68,7 @@ async def _async_main() -> None:
         "access_token": _env("MATRIX_ACCESS_TOKEN", required=True),
         "device_id": _env("MATRIX_DEVICE_ID", "MESHBOT_WETTER"),
         "room": _env("WETTER_ROOM", required=True),  # alias or !id
-        "windy_key": _env("WINDY_API_KEY", required=True),
-        "model": _env("WINDY_MODEL", "iconEu"),
+        "model": _env("OPENMETEO_MODEL", "icon_eu"),
         "lat": float(_env("LOCATION_LAT", "51.7634")),
         "lon": float(_env("LOCATION_LON", "8.3213")),
         "location_name": _env("LOCATION_NAME", "Langenberg"),
@@ -87,8 +86,12 @@ async def _async_main() -> None:
     room_id = cfg["room"]
     if room_id.startswith("#"):
         rid = await sender.resolve_alias(room_id)
-        if rid:
-            room_id = rid
+        if not rid:
+            # Never fall back to posting to the alias itself: Synapse rejects
+            # sends to an alias path with 403 "not in room", which send_text
+            # only logs as a warning -> the bot looks dead for days.
+            raise SystemExit(f"could not resolve alias {room_id}; refusing to post to an alias")
+        room_id = rid
     # Always attempt a join (idempotent if already member). Public rooms only.
     await sender.join(room_id)
     cfg["room_id"] = room_id

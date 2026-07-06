@@ -1,25 +1,23 @@
-"""Windy Point Forecast API wrapper — minimal.
+"""Open-Meteo Point Forecast wrapper (kein API-Key nötig, ICON-EU direkt vom DWD).
 
-Docs: https://api.windy.com/point-forecast/docs
+Docs: https://open-meteo.com/en/docs
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
 
 import requests
 
-
 log = logging.getLogger(__name__)
 
-WINDY_URL = "https://api.windy.com/api/point-forecast/v2"
+OPENMETEO_URL = "https://api.open-meteo.com/v1/forecast"
 
 
 @dataclass
 class Hour:
-    ts: datetime          # UTC
+    ts: datetime
     temp_c: float
     wind_kmh: float
     gust_kmh: float
@@ -27,9 +25,8 @@ class Hour:
     precip_mm: float
     rh_pct: float
     pressure_hpa: float
-    lclouds_pct: float
-    mclouds_pct: float
-    hclouds_pct: float
+    cloud_pct: float
+    weather_code: int = 0
 
     @property
     def dir_cardinal(self) -> str:
@@ -38,58 +35,48 @@ class Hour:
 
     @property
     def cloud_desc(self) -> str:
-        total = max(self.lclouds_pct, self.mclouds_pct, self.hclouds_pct)
-        if total < 25:
+        c = self.cloud_pct
+        if c < 25:
             return "klar"
-        if total < 60:
+        if c < 60:
             return "wolkig"
-        if total < 85:
+        if c < 85:
             return "bewölkt"
         return "bedeckt"
 
 
-def fetch_forecast(api_key: str, lat: float, lon: float, model: str = "iconEu") -> list[Hour]:
-    body = {
-        "lat": lat,
-        "lon": lon,
-        "model": model,
-        "parameters": ["temp", "wind", "windGust", "dewpoint", "rh", "pressure", "lclouds", "mclouds", "hclouds", "precip"],
-        "levels": ["surface"],
-        "key": api_key,
+def fetch_forecast(lat: float, lon: float, model: str = "icon_eu") -> list[Hour]:
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": "temperature_2m,precipitation,wind_speed_10m,wind_gusts_10m,wind_direction_10m,cloud_cover,weather_code",
+        "models": model,
+        "forecast_days": 3,
+        "timezone": "UTC",
+        "wind_speed_unit": "kmh",
     }
-    r = requests.post(WINDY_URL, json=body, timeout=20)
+    r = requests.get(OPENMETEO_URL, params=params, timeout=20)
     r.raise_for_status()
     data = r.json()
-    ts_ms = data["ts"]
+    log.debug("open-meteo model used: %s", data.get("model", model))
+
+    hourly = data["hourly"]
     hours: list[Hour] = []
-    for i, t in enumerate(ts_ms):
-        dt = datetime.fromtimestamp(t / 1000, tz=timezone.utc)
+    for i, time_str in enumerate(hourly["time"]):
         try:
-            # Windy wind components: wind_u-surface, wind_v-surface (m/s)
-            u = data["wind_u-surface"][i]
-            v = data["wind_v-surface"][i]
-            import math
-            ws_ms = math.sqrt(u * u + v * v)
-            wind_kmh = ws_ms * 3.6
-            # direction FROM which wind blows; Windy u/v are "towards", convert
-            dir_to = (math.degrees(math.atan2(-u, -v)) + 360) % 360
-            gust_ms = data.get("gust-surface", [ws_ms] * len(ts_ms))[i]
-            gust_kmh = gust_ms * 3.6
-            temp_k = data["temp-surface"][i]
-            temp_c = temp_k - 273.15
-            precip = data.get("past3hprecip-surface", [0.0] * len(ts_ms))[i]
-            rh = data.get("rh-surface", [0.0] * len(ts_ms))[i]
-            p = data.get("pressure-surface", [0.0] * len(ts_ms))[i]
-            lc = data.get("lclouds-surface", [0.0] * len(ts_ms))[i]
-            mc = data.get("mclouds-surface", [0.0] * len(ts_ms))[i]
-            hc = data.get("hclouds-surface", [0.0] * len(ts_ms))[i]
+            dt = datetime.fromisoformat(time_str).replace(tzinfo=timezone.utc)
             hours.append(Hour(
-                ts=dt, temp_c=temp_c, wind_kmh=wind_kmh, gust_kmh=gust_kmh,
-                dir_deg=dir_to, precip_mm=precip, rh_pct=rh,
-                pressure_hpa=p / 100.0 if p > 10000 else p,
-                lclouds_pct=lc, mclouds_pct=mc, hclouds_pct=hc,
+                ts=dt,
+                temp_c=hourly["temperature_2m"][i] or 0.0,
+                wind_kmh=hourly["wind_speed_10m"][i] or 0.0,
+                gust_kmh=hourly["wind_gusts_10m"][i] or 0.0,
+                dir_deg=hourly["wind_direction_10m"][i] or 0.0,
+                precip_mm=hourly["precipitation"][i] or 0.0,
+                rh_pct=0.0,
+                pressure_hpa=0.0,
+                cloud_pct=hourly["cloud_cover"][i] or 0.0,
+                weather_code=int(hourly["weather_code"][i] or 0),
             ))
         except (KeyError, IndexError, TypeError) as e:
             log.debug("skip idx %d: %s", i, e)
-            continue
     return hours

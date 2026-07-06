@@ -1,0 +1,475 @@
+"""NINA-Polling, Filter, Aggregation und Formatierung für meshbot-nina.
+
+Adaptiert aus /home/klempi/nina-mockup/poll.py (Mockup-Phase 2026-04-26..04-29):
+- sysnotify-Versand entfällt — eine Matrix-Message pro Gruppe geht direkt an
+  den NRW-Bridge-Room. Die Bridge chunkt für LoRa.
+- Multi-Frame-Splitting im Bot entfällt — der Volltext wird in einer Matrix-
+  Message übergeben, die Bridge zerlegt mit (i/n)-Prefix.
+- Severity-Default `Severe`, NATIONWIDE = False (NRW-Kreise).
+"""
+from __future__ import annotations
+
+import html
+import json
+import logging
+import re
+import sqlite3
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Awaitable, Callable
+
+log = logging.getLogger("meshbot-nina")
+
+# 53 NRW-Kreise + kreisfreie Städte. Land-AGS 050000000000 ist faktisch leer
+# (DWD/Bundesweites), MOWAS-Alarme hängen am Kreis — daher 53× Polling.
+AGS_LIST = [
+    "051110000000", "051120000000", "051130000000", "051140000000",
+    "051160000000", "051170000000", "051190000000", "051200000000",
+    "051220000000", "051240000000", "051540000000", "051580000000",
+    "051620000000", "051660000000", "051700000000",
+    "053140000000", "053150000000", "053160000000", "053340000000",
+    "053580000000", "053620000000", "053660000000", "053700000000",
+    "053740000000", "053780000000", "053820000000",
+    "055120000000", "055130000000", "055150000000", "055540000000",
+    "055580000000", "055620000000", "055660000000", "055700000000",
+    "057110000000", "057540000000", "057580000000", "057620000000",
+    "057660000000", "057700000000", "057740000000",
+    "059110000000", "059130000000", "059140000000", "059150000000",
+    "059160000000", "059540000000", "059580000000", "059620000000",
+    "059660000000", "059700000000", "059740000000", "059780000000",
+]
+
+API_BASE = "https://warnung.bund.de/api31"
+USER_AGENT = "meshbot-nina/1.0 (edv@pflueger.de)"
+HTTP_TIMEOUT = 15
+
+SEVERITY_RANK = {"Minor": 1, "Moderate": 2, "Severe": 3, "Extreme": 4}
+SEVERITY_ICON = {"Minor": "ℹ️", "Moderate": "⚠️", "Severe": "🟧", "Extreme": "🚨"}
+
+# Soft-Cap pro Matrix-Message: Header + Auszug zusammen. Die Bridge chunkt auf
+# ~140 Zeichen pro LoRa-Frame; ein Cap von ~360 hält uns bei 2–3 Mesh-Frames
+# pro Warnung — genug für brauchbaren Inhalt, ohne den Channel zu fluten.
+MAX_TOTAL = 360
+
+BOILERPLATE_PATTERNS = [
+    re.compile(r"^Die\s+(Feuerwehr|Stadt|Polizei|Stadtverwaltung|Verwaltung)\b.*\binformiert\s*:?\s*$", re.IGNORECASE),
+    re.compile(r"^Es folgt eine wichtige (Information|Mitteilung)\b", re.IGNORECASE),
+    re.compile(r"^Dies ist die Entwarnung zur Warnung\b", re.IGNORECASE),
+    re.compile(r"^Diese Warnung erfolgt für\b", re.IGNORECASE),
+    re.compile(r"^Halten Sie die Notrufnummern\b", re.IGNORECASE),
+]
+
+CANCEL_STATUS_PATTERNS = [
+    re.compile(r"Die\s+Warnung\s+(?:ist|wurde|wird(?:\s+hiermit)?)\s+aufgehoben\.?", re.IGNORECASE),
+    re.compile(r"Die\s+(?:akute\s+)?Gefahr\s+(?:ist\s+vorüber|besteht\s+nicht\s+mehr)\.?", re.IGNORECASE),
+]
+
+CANCEL_DROP_PATTERNS = [
+    re.compile(r"^Dies ist die Entwarnung zur Warnung\b", re.IGNORECASE),
+    re.compile(
+        r"^(?:Schließen|Halten|Lassen|Öffnen|Vermeiden|Bleiben|Verlassen|"
+        r"Suchen|Befolgen|Beachten|Meiden|Hören|Schalten|Achten|Folgen|"
+        r"Informieren|Warten|Helfen|Trinken|Verzichten|Begeben|Stellen|"
+        r"Bringen|Setzen|Ziehen|Decken|Nehmen|Vergewissern)\s+Sie\b",
+        re.IGNORECASE,
+    ),
+]
+
+
+# --- Persistenz --------------------------------------------------------------
+
+def db_open(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(path)
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS seen(
+               id        TEXT NOT NULL,
+               version   INTEGER NOT NULL,
+               sent      TEXT,
+               first_seen TEXT NOT NULL,
+               PRIMARY KEY(id, version)
+           )"""
+    )
+    return c
+
+
+def already_seen(c: sqlite3.Connection, wid: str, version: int) -> bool:
+    return c.execute(
+        "SELECT 1 FROM seen WHERE id=? AND version=?", (wid, version)
+    ).fetchone() is not None
+
+
+def mark_seen(c: sqlite3.Connection, wid: str, version: int, sent: str | None) -> None:
+    c.execute(
+        "INSERT OR IGNORE INTO seen(id,version,sent,first_seen) VALUES(?,?,?,?)",
+        (wid, version, sent, datetime.now(timezone.utc).isoformat()),
+    )
+    c.commit()
+
+
+# --- HTTP --------------------------------------------------------------------
+
+ETAGS: dict[str, str] = {}
+
+
+def http_get(url: str, etag: str | None = None) -> tuple[int, str | None, bytes]:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    if etag:
+        req.add_header("If-None-Match", etag)
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+            return r.status, r.headers.get("ETag"), r.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 304:
+            return 304, etag, b""
+        raise
+
+
+def fetch_dashboard(ags: str) -> list[dict] | None:
+    url = f"{API_BASE}/dashboard/{ags}.json"
+    status, etag, body = http_get(url, ETAGS.get(ags))
+    if status == 304:
+        return None
+    if etag:
+        ETAGS[ags] = etag
+    return json.loads(body) if body else []
+
+
+def fetch_detail(wid: str) -> dict | None:
+    try:
+        _, _, body = http_get(f"{API_BASE}/warnings/{wid}.json")
+        return json.loads(body)
+    except Exception as e:
+        log.warning("detail fetch failed (%s): %s", wid, e)
+        return None
+
+
+# --- Filter ------------------------------------------------------------------
+
+def severity_ok(sev: str | None, minimum: str | dict) -> bool:
+    """Akzeptiert entweder eine globale Schwelle ("Severe") oder ein Dict
+    {provider: minimum, "_default": minimum} für provider-spezifische Schwellen.
+    """
+    rank_sev = SEVERITY_RANK.get(sev or "", 0)
+    if isinstance(minimum, str):
+        return rank_sev >= SEVERITY_RANK.get(minimum, 3)
+    raise TypeError("severity_ok: minimum must be str when called directly")
+
+
+def severity_threshold_for(provider: str | None, severity_min: str | dict) -> str:
+    if isinstance(severity_min, str):
+        return severity_min
+    if provider and provider in severity_min:
+        return severity_min[provider]
+    return severity_min.get("_default", "Severe")
+
+
+def msgtype_ok(mt: str | None, fwd_cancel: bool, fwd_update: bool) -> bool:
+    if mt == "Cancel":
+        return fwd_cancel
+    if mt == "Update":
+        return fwd_update
+    return True
+
+
+# Default-Blacklist für Themen die klempi explizit NICHT übers Mesh hören will.
+# Treffer auf headline + event + (optional) description. Case-insensitive, Substring.
+# Erweiterbar per env NINA_EXCLUDE_PATTERNS="muster1,muster2,…" (überschreibt Default).
+DEFAULT_EXCLUDE_PATTERNS = (
+    r"geruch",            # „Geruchsbelästigung", „Geruchsmeldung", „starker Geruch"
+)
+
+
+def compile_exclude_patterns(spec: str | None) -> tuple[re.Pattern, ...]:
+    if spec is None:
+        raw = DEFAULT_EXCLUDE_PATTERNS
+    else:
+        raw = tuple(p.strip() for p in spec.split(",") if p.strip())
+    return tuple(re.compile(p, re.IGNORECASE) for p in raw)
+
+
+def topic_excluded(
+    detail: dict | None,
+    dashboard_headline: str | None,
+    patterns: tuple[re.Pattern, ...],
+) -> str | None:
+    """Gibt den getroffenen Pattern-Quelltext zurück, sonst None."""
+    if not patterns:
+        return None
+    haystacks: list[str] = []
+    if dashboard_headline:
+        haystacks.append(dashboard_headline)
+    if detail:
+        for info in detail.get("info", []) or []:
+            for k in ("headline", "event", "description"):
+                v = info.get(k)
+                if v:
+                    haystacks.append(v)
+    text = " | ".join(haystacks)
+    if not text:
+        return None
+    for p in patterns:
+        if p.search(text):
+            return p.pattern
+    return None
+
+
+# --- Aggregation -------------------------------------------------------------
+
+def group_key(entry: dict, detail: dict | None) -> tuple:
+    p = entry.get("payload", {})
+    d = p.get("data", {})
+    info0 = (detail or {}).get("info", [{}])[0] if detail else {}
+    headline = info0.get("headline") or info0.get("event") or d.get("headline") or "?"
+    return (
+        d.get("provider") or "?",
+        d.get("severity") or "?",
+        d.get("msgType") or "?",
+        headline,
+    )
+
+
+def collect_areas(items: list[tuple[dict, dict | None]]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for _, detail in items:
+        if not detail:
+            continue
+        for info in detail.get("info", []):
+            for area in info.get("area", []):
+                a = (area.get("areaDesc") or "").split(",")[0].strip()
+                if a and a not in seen:
+                    seen.add(a)
+                    out.append(a)
+    return out
+
+
+def extract_cancel_status(text: str | None) -> str:
+    if not text:
+        return "Warnung aufgehoben."
+    s = html.unescape(text)
+    s = re.sub(r"<br\s*/?>", "\n", s, flags=re.IGNORECASE)
+    s = re.sub(r"<[^>]+>", "", s)
+    keep: list[str] = []
+    for sent in re.split(r"(?<=[.!?])\s+|\n+", s):
+        sent = sent.strip()
+        if not sent:
+            continue
+        if any(p.search(sent) for p in CANCEL_STATUS_PATTERNS):
+            continue
+        if any(p.match(sent) for p in CANCEL_DROP_PATTERNS):
+            continue
+        keep.append(sent)
+    context = " ".join(keep).strip()
+    return context if context else "Warnung aufgehoben."
+
+
+def clean_description(text: str | None) -> str:
+    if not text:
+        return ""
+    s = html.unescape(text)
+    s = re.sub(r"<br\s*/?>", "\n", s, flags=re.IGNORECASE)
+    s = re.sub(r"<[^>]+>", "", s)
+    out: list[str] = []
+    for ln in (l.strip() for l in s.splitlines()):
+        if not ln:
+            continue
+        if any(p.search(ln) for p in BOILERPLATE_PATTERNS):
+            continue
+        out.append(ln)
+    return " ".join(out)
+
+
+def collapse_redundancy(desc: str, headline: str) -> str:
+    if not desc or not headline:
+        return desc
+    words = re.findall(r"\b[A-ZÄÖÜ][a-zäöüß]{6,}\b", headline)
+    for w in words:
+        desc = re.sub(
+            r"\s+(?:zu|von|in|um|über|auf)\s+(?:einer?|einem|einen|den?|dem|der|das)?\s*"
+            + re.escape(w) + r"\b\.?",
+            "",
+            desc,
+            flags=re.IGNORECASE,
+        )
+    desc = re.sub(r"\s{2,}", " ", desc).strip()
+    return desc
+
+
+def fit_into(text: str, budget: int) -> str:
+    if budget <= 0 or not text:
+        return ""
+    if len(text) <= budget:
+        return text
+    cut = text[: budget - 1].rsplit(" ", 1)[0]
+    if not cut:
+        cut = text[: budget - 1]
+    return cut + "…"
+
+
+def format_group(key: tuple, items: list[tuple[dict, dict | None]]) -> str:
+    """Eine Matrix-Message pro Gruppe. Bridge chunkt für LoRa."""
+    provider, severity, msgtype, headline = key
+    icon = SEVERITY_ICON.get(severity, "?")
+    if msgtype == "Cancel":
+        tag = "[ENTWARNUNG] "
+        headline = re.sub(
+            r"^(?:Entwarnung|Aufhebung)\s*[:\-]?\s*", "", headline, count=1, flags=re.IGNORECASE
+        )
+    elif msgtype == "Update":
+        tag = "[UPDATE] "
+        headline = re.sub(
+            r"^(?:Update|Aktualisierung)\s*[:\-]?\s*", "", headline, count=1, flags=re.IGNORECASE
+        )
+    else:
+        tag = ""
+
+    areas = collect_areas(items)
+    if len(areas) == 1 and headline:
+        suffix = f" - {areas[0]}"
+        while headline.endswith(suffix):
+            headline = headline[: -len(suffix)].rstrip()
+
+    excerpt = ""
+    if len(items) == 1:
+        _, detail = items[0]
+        desc_raw = ""
+        if detail:
+            for info in detail.get("info", []):
+                if info.get("description"):
+                    desc_raw = info["description"]
+                    break
+        if msgtype == "Cancel":
+            excerpt = extract_cancel_status(desc_raw)
+        else:
+            excerpt = collapse_redundancy(clean_description(desc_raw), headline)
+
+    msg = f"{icon} {tag}{headline}"
+    if provider and provider != "MOWAS":
+        msg += f" ({provider})"
+
+    haystack = headline + " " + excerpt
+    areas_to_show = [
+        a for a in areas
+        if not re.search(rf"\b{re.escape(a)}\b", haystack, re.IGNORECASE)
+    ]
+    if areas_to_show:
+        n = len(areas_to_show)
+        if n == 1:
+            msg += f" — {areas_to_show[0]}"
+        else:
+            base = f"{msg} — "
+            shown: list[str] = []
+            for a in areas_to_show:
+                test = base + ", ".join(shown + [a])
+                if len(test) + len(f" +{n} weitere") <= MAX_TOTAL // 2:
+                    shown.append(a)
+                else:
+                    break
+            if not shown:
+                msg += f" — {n} Gebiete"
+            elif len(shown) < n:
+                msg += " — " + ", ".join(shown) + f" +{n - len(shown)} weitere"
+            else:
+                msg += " — " + ", ".join(shown)
+
+    if not excerpt:
+        return msg
+
+    sep = " · "
+    budget = MAX_TOTAL - len(msg) - len(sep)
+    if budget <= 0:
+        return msg
+    return msg + sep + fit_into(excerpt, budget)
+
+
+# --- Tick --------------------------------------------------------------------
+
+SendFn = Callable[[str], Awaitable[None]]
+
+
+async def run_tick(
+    conn: sqlite3.Connection,
+    send: SendFn,
+    severity_min: str | dict,
+    fwd_cancel: bool,
+    fwd_update: bool,
+    exclude_patterns: tuple[re.Pattern, ...] = (),
+) -> None:
+    new_items: list[tuple[dict, dict | None]] = []
+    n_304 = 0
+    n_empty = 0
+
+    for ags in AGS_LIST:
+        try:
+            entries = fetch_dashboard(ags)
+        except Exception as e:
+            log.warning("%s HTTP-Fehler: %s", ags, e)
+            continue
+        if entries is None:
+            n_304 += 1
+            continue
+        if not entries:
+            n_empty += 1
+            continue
+        log.info("%s %d Warnung(en) im Dashboard", ags, len(entries))
+        for e in entries:
+            p = e.get("payload", {})
+            wid = p.get("id")
+            ver = int(p.get("version", 0))
+            d = p.get("data", {})
+
+            if not wid or already_seen(conn, wid, ver):
+                continue
+
+            sev = d.get("severity")
+            mt = d.get("msgType")
+            provider = d.get("provider")
+            threshold = severity_threshold_for(provider, severity_min)
+
+            reason = None
+            if not severity_ok(sev, threshold):
+                reason = f"sev={sev} < {threshold} (provider={provider})"
+            elif not msgtype_ok(mt, fwd_cancel, fwd_update):
+                reason = f"msgType={mt} verworfen"
+
+            if reason:
+                log.info("ignoriert (%s) %s v%d", reason, wid, ver)
+                mark_seen(conn, wid, ver, e.get("sent"))
+                continue
+
+            detail = fetch_detail(wid)
+            hit = topic_excluded(detail, d.get("headline"), exclude_patterns)
+            if hit:
+                log.info("ignoriert (topic match '%s') %s v%d", hit, wid, ver)
+                mark_seen(conn, wid, ver, e.get("sent"))
+                continue
+            new_items.append((e, detail))
+
+    log.info(
+        "tick fertig: %d×304, %d×leer, %d mit Inhalt, %d neu",
+        n_304, n_empty, len(AGS_LIST) - n_304 - n_empty, len(new_items),
+    )
+
+    if not new_items:
+        return
+
+    groups: dict[tuple, list[tuple[dict, dict | None]]] = {}
+    for it in new_items:
+        groups.setdefault(group_key(*it), []).append(it)
+
+    log.info("%d neue Einträge → %d Gruppe(n)", len(new_items), len(groups))
+
+    for key, items in groups.items():
+        msg = format_group(key, items)
+        log.info("send (%d ch): %s", len(msg), msg)
+        try:
+            await send(msg)
+        except Exception as e:
+            log.exception("matrix send failed: %s", e)
+            continue
+        for entry, _ in items:
+            p = entry.get("payload", {})
+            mark_seen(conn, p.get("id"), int(p.get("version", 0)), entry.get("sent"))

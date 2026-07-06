@@ -60,7 +60,35 @@ class SimpleMatrixSender:
     async def resolve_alias(self, alias: str) -> Optional[str]:
         assert self.client is not None
         resp = await self.client.room_resolve_alias(alias)
-        return getattr(resp, "room_id", None)
+        rid = getattr(resp, "room_id", None)
+        if rid:
+            return rid
+        # nio's room_resolve_alias has been failing to validate this Synapse's
+        # directory response (observed since 2026-05). Fall back to a raw CS-API
+        # GET, which returns a clean {"room_id": ...}. Without this the caller
+        # would silently keep the alias and post to it -> 403 "not in room".
+        log.warning("matrix: nio alias resolve failed for %s, trying raw HTTP", alias)
+        return await self._resolve_alias_http(alias)
+
+    async def _resolve_alias_http(self, alias: str) -> Optional[str]:
+        import urllib.parse
+
+        import aiohttp
+
+        url = (
+            f"{self.homeserver}/_matrix/client/v3/directory/room/"
+            f"{urllib.parse.quote(alias)}"
+        )
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers) as r:
+                    if r.status == 200:
+                        return (await r.json()).get("room_id")
+                    log.warning("matrix: raw alias resolve %s -> HTTP %s", alias, r.status)
+        except Exception as e:  # noqa: BLE001
+            log.warning("matrix: raw alias resolve error: %s", e)
+        return None
 
     async def close(self) -> None:
         if self.client:
