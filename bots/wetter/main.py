@@ -10,12 +10,12 @@ import json
 import logging
 import os
 import signal
-import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from shared.alert import alert
 from shared.matrix_sender import SimpleMatrixSender
 
 from .windy import fetch_forecast
@@ -39,17 +39,6 @@ def _env(key: str, default: str | None = None, required: bool = False) -> str:
     if required and not v:
         raise SystemExit(f"env {key} required")
     return v  # type: ignore[return-value]
-
-
-def _alert(msg: str) -> None:
-    """Best-effort out-of-band alert via sysnotify (FHEM MatrixBot → Raum 'ich').
-
-    Uses a different Matrix account/path than this bot, so it still works when
-    this bot's token or room permissions are the problem."""
-    try:
-        subprocess.run(["/usr/local/bin/sysnotify", "ich", msg], timeout=20, check=False)
-    except Exception:
-        log.warning("sysnotify alert failed", exc_info=True)
 
 
 async def _fetch_with_retry(cfg: dict) -> list:
@@ -94,7 +83,7 @@ async def _post_forecast(
         health["send_failures"] += 1
         log.error("matrix send failed (%d consecutive slot(s))", health["send_failures"])
         if health["send_failures"] >= MAX_CONSECUTIVE_SEND_FAILURES:
-            _alert(
+            alert(
                 f"meshbot-wetter: {health['send_failures']} Wetter-Posts in Folge "
                 f"fehlgeschlagen (Raum {room_id}) — Bot beendet sich für Neustart. "
                 f"Token/Raum-Rechte prüfen: journalctl --user -u meshbot-wetter"

@@ -12,12 +12,18 @@ import os
 import signal
 from pathlib import Path
 
+from shared.alert import alert
 from shared.matrix_sender import SimpleMatrixSender
 
 from . import poll as nina
 
 
 log = logging.getLogger("meshbot-nina")
+
+# Nach so vielen fehlgeschlagenen Sends in Folge (Retry alle 90 s, weil die
+# Warnung ohne mark_seen im nächsten Tick erneut ansteht): sysnotify-Alarm +
+# Exit 1 → systemd-Restart, Problem steht im Journal statt still zu bleiben.
+MAX_CONSECUTIVE_SEND_FAILURES = 10
 
 
 def _env(key: str, default: str | None = None, required: bool = False) -> str:
@@ -81,8 +87,25 @@ async def _async_main() -> None:
     await sender.join(room_id)
     log.info("nina room id: %s", room_id)
 
+    send_failures = 0
+
     async def send(text: str) -> None:
-        await sender.send_text(room_id, text)
+        # MUSS bei Fehlschlag werfen: run_tick() ruft mark_seen() nur nach
+        # erfolgreichem Send — ein stiller Fehlschlag würde die Warnung als
+        # "gesehen" verbrennen und sie käme nie wieder (Incident 2026-05).
+        nonlocal send_failures
+        if await sender.send_text(room_id, text):
+            send_failures = 0
+            return
+        send_failures += 1
+        if send_failures >= MAX_CONSECUTIVE_SEND_FAILURES:
+            alert(
+                f"meshbot-nina: {send_failures} Matrix-Sends in Folge fehlgeschlagen "
+                f"(Raum {room_id}) — Bot beendet sich für Neustart. NINA-Warnungen "
+                f"erreichen das Mesh NICHT! journalctl --user -u meshbot-nina"
+            )
+            raise SystemExit(1)
+        raise RuntimeError(f"matrix send failed ({send_failures} in Folge)")
 
     sev_summary = ", ".join(f"{k}>={v}" for k, v in cfg["severity_min"].items())
     excl_summary = ", ".join(p.pattern for p in exclude_patterns) or "—"
