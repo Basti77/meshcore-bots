@@ -40,7 +40,7 @@ _WMO_EMOJI = {
 def _weather_emoji(h: Hour) -> str:
     # Sturm überschreibt alles (Böen >= 62 km/h = Bft 8)
     if h.gust_kmh >= 62:
-        return "🌪️" if h.precip_mm < 0.2 else "⛈️"
+        return "💨" if h.precip_mm < 0.2 else "⛈️"
     return _WMO_EMOJI.get(h.weather_code, "🌦️")
 
 

@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,6 +24,15 @@ from .format import format_ticker
 
 log = logging.getLogger("meshbot-wetter")
 
+# Backoff between fetch attempts within one slot. A transient open-meteo 503
+# at the full hour must not cost the whole 6h slot (happened 2026-07-04).
+FETCH_BACKOFF_S = (30, 120, 300)
+# One in-slot send retry, then the slot counts as failed.
+SEND_RETRY_DELAY_S = 60
+# After this many consecutive failed slots the bot alerts + exits non-zero,
+# so the problem surfaces in systemd/journal instead of a silent zombie.
+MAX_CONSECUTIVE_SEND_FAILURES = 2
+
 
 def _env(key: str, default: str | None = None, required: bool = False) -> str:
     v = os.environ.get(key, default)
@@ -31,23 +41,70 @@ def _env(key: str, default: str | None = None, required: bool = False) -> str:
     return v  # type: ignore[return-value]
 
 
-async def _post_forecast(sender: SimpleMatrixSender, room_id: str, cfg: dict) -> None:
+def _alert(msg: str) -> None:
+    """Best-effort out-of-band alert via sysnotify (FHEM MatrixBot → Raum 'ich').
+
+    Uses a different Matrix account/path than this bot, so it still works when
+    this bot's token or room permissions are the problem."""
     try:
-        hours = fetch_forecast(cfg["lat"], cfg["lon"], cfg["model"])
-    except Exception as e:
-        log.exception("windy fetch failed: %s", e)
-        return
+        subprocess.run(["/usr/local/bin/sysnotify", "ich", msg], timeout=20, check=False)
+    except Exception:
+        log.warning("sysnotify alert failed", exc_info=True)
+
+
+async def _fetch_with_retry(cfg: dict) -> list:
+    attempts = 1 + len(FETCH_BACKOFF_S)
+    for i in range(attempts):
+        if i:
+            await asyncio.sleep(FETCH_BACKOFF_S[i - 1])
+        try:
+            hours = await asyncio.to_thread(
+                fetch_forecast, cfg["lat"], cfg["lon"], cfg["model"]
+            )
+        except Exception as e:
+            log.warning("open-meteo fetch failed (attempt %d/%d): %s", i + 1, attempts, e)
+            continue
+        if hours:
+            return hours
+        log.warning("open-meteo returned no hours (attempt %d/%d)", i + 1, attempts)
+    log.error("open-meteo fetch gave up after %d attempts", attempts)
+    return []
+
+
+async def _post_forecast(
+    sender: SimpleMatrixSender, room_id: str, cfg: dict, health: dict
+) -> None:
+    hours = await _fetch_with_retry(cfg)
     if not hours:
-        log.warning("windy returned no hours")
+        # Upstream problem, not ours — the next slot retries with fresh data.
         return
     msg = format_ticker(cfg["location_name"], hours)
     log.info("posting forecast to %s:\n%s", room_id, msg)
-    try:
-        await sender.send_text(room_id, msg)
-    except Exception as e:
-        log.exception("matrix send failed: %s", e)
 
-    # persist last-run timestamp
+    ok = False
+    try:
+        ok = await sender.send_text(room_id, msg)
+        if not ok:
+            await asyncio.sleep(SEND_RETRY_DELAY_S)
+            ok = await sender.send_text(room_id, msg)
+    except Exception:
+        log.exception("matrix send raised")
+
+    if not ok:
+        health["send_failures"] += 1
+        log.error("matrix send failed (%d consecutive slot(s))", health["send_failures"])
+        if health["send_failures"] >= MAX_CONSECUTIVE_SEND_FAILURES:
+            _alert(
+                f"meshbot-wetter: {health['send_failures']} Wetter-Posts in Folge "
+                f"fehlgeschlagen (Raum {room_id}) — Bot beendet sich für Neustart. "
+                f"Token/Raum-Rechte prüfen: journalctl --user -u meshbot-wetter"
+            )
+            health["exit_code"] = 1
+            health["stop"].set()
+        return
+
+    health["send_failures"] = 0
+    # persist last *successful* post
     state_dir = Path(cfg["state_dir"])
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "last.json").write_text(json.dumps({
@@ -97,13 +154,16 @@ async def _async_main() -> None:
     cfg["room_id"] = room_id
     log.info("wetter room id: %s", room_id)
 
+    stop = asyncio.Event()
+    health = {"send_failures": 0, "exit_code": 0, "stop": stop}
+
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(
         _post_forecast,
         "cron",
         hour=f"*/{cfg['schedule_hours']}",
         minute=0,
-        args=[sender, room_id, cfg],
+        args=[sender, room_id, cfg, health],
         id="forecast",
         coalesce=True,
         misfire_grace_time=300,
@@ -111,9 +171,8 @@ async def _async_main() -> None:
     scheduler.start()
 
     if cfg["post_on_startup"]:
-        await _post_forecast(sender, room_id, cfg)
+        await _post_forecast(sender, room_id, cfg, health)
 
-    stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
@@ -122,6 +181,8 @@ async def _async_main() -> None:
 
     scheduler.shutdown(wait=False)
     await sender.close()
+    if health["exit_code"]:
+        raise SystemExit(health["exit_code"])
 
 
 def main() -> None:

@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from nio import AsyncClient, AsyncClientConfig, LoginResponse, RoomSendResponse
+from nio import AsyncClient, AsyncClientConfig, RoomSendResponse, WhoamiResponse
 
 
 log = logging.getLogger(__name__)
@@ -34,11 +34,21 @@ class SimpleMatrixSender:
         self.client.access_token = self.access_token
         self.client.user_id = self.user_id
         self.client.device_id = self.device_id
-        # quick sync to warm caches / validate token
+        # Validate the token up front. An expired/revoked token must be a hard
+        # startup failure (systemd restarts + it shows in the journal) — not a
+        # per-send warning that leaves the bot looking alive for weeks.
+        resp = await self.client.whoami()
+        if not isinstance(resp, WhoamiResponse):
+            await self.client.close()
+            raise RuntimeError(f"matrix token check failed for {self.user_id}: {resp!r}")
+        # quick sync to warm caches (best effort — transient failures are fine)
         await self.client.sync(timeout=3000, full_state=False)
-        log.info("matrix: connected as %s", self.user_id)
+        log.info("matrix: connected as %s (token ok)", self.user_id)
 
-    async def send_text(self, room_id: str, body: str) -> None:
+    async def send_text(self, room_id: str, body: str) -> bool:
+        """Send a plain text message. Returns True on success — callers decide
+        whether a failure is worth escalating (nio reports errors as
+        ErrorResponse objects, it does not raise)."""
         assert self.client is not None, "call connect() first"
         resp = await self.client.room_send(
             room_id=room_id,
@@ -48,6 +58,8 @@ class SimpleMatrixSender:
         )
         if not isinstance(resp, RoomSendResponse):
             log.warning("matrix: send failed: %r", resp)
+            return False
+        return True
 
     async def join(self, room_id_or_alias: str) -> Optional[str]:
         assert self.client is not None

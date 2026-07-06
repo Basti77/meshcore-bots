@@ -72,8 +72,12 @@ async def _async_main() -> None:
     room_id = cfg["room"]
     if room_id.startswith("#"):
         rid = await sender.resolve_alias(room_id)
-        if rid:
-            room_id = rid
+        if not rid:
+            # Never fall back to posting to the alias string: Synapse rejects
+            # that with 403 "not in room" on every send and the bot looks
+            # alive while nothing reaches the mesh (2026-05-22 incident).
+            raise SystemExit(f"could not resolve alias {room_id}; refusing to post to an alias")
+        room_id = rid
     await sender.join(room_id)
     log.info("nina room id: %s", room_id)
 
